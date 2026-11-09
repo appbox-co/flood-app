@@ -237,7 +237,7 @@ def config_text(name):
     return command(['docker', 'exec', name, 'cat', '/torrents/config/rtorrent/.rtorrent.rc']).decode()
 
 
-def native_user_id(name):
+def native_users(name):
     data = command(['docker', 'exec', name, 'cat', '/home/flood/.local/db/users.db']).decode()
     records = {}
     for line in data.splitlines():
@@ -246,9 +246,44 @@ def native_user_id(name):
             records.pop(record['_id'], None)
         elif '_id' in record:
             records[record['_id']] = record
-    matches = [record['_id'] for record in records.values() if record.get('username') == user]
+    return [record for record in records.values() if record.get('username')]
+
+
+def native_user_id(name):
+    matches = [record['_id'] for record in native_users(name) if record.get('username') == user]
     assert len(matches) == 1
     return matches[0]
+
+
+USERS_INDEX = json.dumps({'$$indexCreated': {'fieldName': 'username', 'unique': True, 'sparse': False}}) + '\n'
+
+
+def prepare_database(volume, files):
+    # Write a persisted Flood database owned by UID 1000, as an existing install has it.
+    script = """import json,os,pathlib,sys
+root=pathlib.Path('/data')
+for name,text in json.loads(sys.argv[1]).items():
+    path=root/name
+    path.parent.mkdir(parents=True,exist_ok=True)
+    path.write_text(text)
+for folder,dirs,files in os.walk(root):
+    os.chown(folder,1000,1000)
+    for name in files:
+        os.chown(os.path.join(folder,name),1000,1000)
+"""
+    command(['docker', 'run', '--rm', '--network', 'none', '--label', 'appbox.release-gate=' + run_id,
+             '-v', volume + ':/data', '--entrypoint', 'python3', image, '-c', script, json.dumps(files)])
+
+
+def auth_state(name):
+    # Flood reports initialUser while it would show its first-run registration page.
+    # No session cookie is sent, so a configured Flood must answer 401.
+    target = urllib.request.Request(url(name, '/api/auth/verify'), headers={'Authorization': auth})
+    try:
+        with urllib.request.urlopen(target, timeout=10) as response:
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        return error.code, json.loads(error.read())
 
 
 def bencode(value):
@@ -324,6 +359,7 @@ def check_persisted(name, fixture):
 
 try:
     command([sys.executable, str(Path(__file__).with_name('test-callback.py'))])
+    print(command([sys.executable, '-I', str(Path(__file__).parents[1] / 'tests' / 'test-bootstrap.py')]).decode().strip().splitlines()[-1], flush=True)
     details = json.loads(command(['docker', 'image', 'inspect', image]))[0]
     assert details['Architecture'] == 'amd64' and details['Os'] == 'linux'
     version = command(['docker', 'run', '--rm', '--network', 'none', '--entrypoint', 'flood', image, '--version']).decode()
@@ -444,6 +480,75 @@ try:
     check_web(upgraded)
     assert native_user_id(upgraded) == baseline_user_id
     print('PASS password reset: HTTP and native Flood authentication updated without replacing user', flush=True)
+    command(['docker', 'stop', '--time', '45', upgraded])
+    # The catalogue default this release replaces, with ordinary persisted data.
+    default_storage = storage('default')
+    default = launch('default', registry.DEFAULT, default_storage)
+    wait_ready(default, RTORRENT)
+    default_fixture = seed(default)
+    default_user_id = native_user_id(default)
+    default_config = config_text(default)
+    command(['docker', 'stop', '--time', '45', default])
+    following = launch('following', image, default_storage)
+    wait_ready(following, RTORRENT)
+    check_persisted(following, default_fixture)
+    assert native_user_id(following) == default_user_id
+    assert config_text(following) == default_config, 'Migrated configuration changed again'
+    command(['docker', 'exec', following, 'test', '!', '-e', '/home/flood/.local/db/users.db.pre-seed'])
+    check_runtime(following)
+    check_limits(following)
+    command(['docker', 'stop', '--time', '45', following])
+    print('PASS default upgrade: 4.16.1-0.16.25 data, session, configuration and user preserved', flush=True)
+    # An install that ran Flood without authentication can keep a users.db with
+    # only its index line. 4.16.1-0.16.25 then served the first-run registration
+    # page; this release must create the default user instead. The password
+    # holds characters that break hand-built JSON or shell quoting.
+    saved_password, saved_auth = password, auth
+    password = 'Gate "quote" \\back\'slash $HOME `x` ' + secrets.token_urlsafe(12)
+    auth = 'Basic ' + base64.b64encode((user + ':' + password).encode()).decode()
+    userless_storage = storage('userless')
+    prepare_database(userless_storage[1], {'db/users.db': USERS_INDEX,
+                                           'db/_config/settings/settings.db': ''})
+    unfixed = launch('userless-default', registry.DEFAULT, userless_storage)
+    wait_ready(unfixed, RTORRENT)
+    status, state = auth_state(unfixed)
+    assert state.get('initialUser') is True and not native_users(unfixed), 'Fixture did not reproduce the first-run page'
+    command(['docker', 'stop', '--time', '45', unfixed])
+    seeded = launch('userless-fixed', image, userless_storage)
+    wait_ready(seeded, RTORRENT)
+    status, state = auth_state(seeded)
+    assert status == 401 and not state.get('initialUser'), 'First-run page still served: ' + str(status)
+    seeded_user_id = native_user_id(seeded)
+    assert len(native_users(seeded)) == 1
+    check_web(seeded)
+    kept = command(['docker', 'exec', seeded, 'cat', '/home/flood/.local/db/users.db.pre-seed']).decode()
+    assert kept == USERS_INDEX, 'Original user database not kept'
+    command(['docker', 'restart', '--time', '45', seeded])
+    wait_ready(seeded, RTORRENT)
+    assert native_user_id(seeded) == seeded_user_id and len(native_users(seeded)) == 1
+    replacement = 'Reset "quote" \\back\'slash $PATH ' + secrets.token_urlsafe(12)
+    command(['docker', 'exec', '-i', seeded, '/scripts/reset-password.py'], data=replacement.encode())
+    password = replacement
+    auth = 'Basic ' + base64.b64encode((user + ':' + password).encode()).decode()
+    openers.pop(seeded, None)
+    wait_ready(seeded, RTORRENT)
+    check_web(seeded)
+    assert native_user_id(seeded) == seeded_user_id
+    command(['docker', 'stop', '--time', '45', seeded])
+    print('PASS index-only database: 4.16.1-0.16.25 showed registration; default user created once, '
+          'special-character login and password reset work', flush=True)
+    deleted_storage = storage('deleted')
+    prepare_database(deleted_storage[1], {'db/users.db': USERS_INDEX
+                                          + json.dumps({'username': 'olduser', 'password': 'x', '_id': 'a1b2c3d4e5f60718'}) + '\n'
+                                          + json.dumps({'$$deleted': True, '_id': 'a1b2c3d4e5f60718'}) + '\n'})
+    recreated = launch('deleted-users', image, deleted_storage)
+    wait_ready(recreated, RTORRENT)
+    native_user_id(recreated)
+    assert len(native_users(recreated)) == 1
+    check_web(recreated)
+    command(['docker', 'stop', '--time', '45', recreated])
+    print('PASS deleted-users database: default user created', flush=True)
+    password, auth = saved_password, saved_auth
 except Exception as error:
     diagnostic = str(error)
     for secret in (password, callback_token, auth):

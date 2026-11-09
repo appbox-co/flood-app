@@ -3,8 +3,10 @@
 import subprocess
 import sys
 
-EXPECTED = 'repo.cylo.net/flood:4.16.1-0.16.25'
-# 4.16.1-0.16.23-2, the catalogue default this release replaces.
+EXPECTED = 'repo.cylo.net/flood:4.16.1-0.16.25-1'
+# 4.16.1-0.16.25, the catalogue default this release replaces.
+DEFAULT = 'repo.cylo.net/flood@sha256:31c37755be7738668134bdffc1a70fe4af55433024304f0a3e7222ce4d7a2ca8'
+# 4.16.1-0.16.23-2, the previous default; instances still run it.
 CURRENT = 'repo.cylo.net/flood@sha256:2714c4f24faabe999a1c23cb75110f006c3dcf81216ef5c8b9ffe96e38a784f5'
 PREVIOUS = 'repo.cylo.net/flood@sha256:1e94603a770407d55e148660712ee8c94a0599d325f98c094221ed4193cc78de'
 
