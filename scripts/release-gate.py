@@ -514,6 +514,11 @@ try:
     status, state = auth_state(unfixed)
     assert state.get('initialUser') is True and not native_users(unfixed), 'Fixture did not reproduce the first-run page'
     command(['docker', 'stop', '--time', '45', unfixed])
+    # Flood adds its own index lines, so keep the file exactly as 0.16.25 left it.
+    left_by_default = command(['docker', 'run', '--rm', '--network', 'none', '--label', 'appbox.release-gate=' + run_id,
+                               '-v', userless_storage[1] + ':/data', '--entrypoint', 'cat', image,
+                               '/data/db/users.db']).decode()
+    assert USERS_INDEX in left_by_default
     seeded = launch('userless-fixed', image, userless_storage)
     wait_ready(seeded, RTORRENT)
     status, state = auth_state(seeded)
@@ -522,7 +527,7 @@ try:
     assert len(native_users(seeded)) == 1
     check_web(seeded)
     kept = command(['docker', 'exec', seeded, 'cat', '/home/flood/.local/db/users.db.pre-seed']).decode()
-    assert kept == USERS_INDEX, 'Original user database not kept'
+    assert kept == left_by_default, 'Original user database not kept'
     command(['docker', 'restart', '--time', '45', seeded])
     wait_ready(seeded, RTORRENT)
     assert native_user_id(seeded) == seeded_user_id and len(native_users(seeded)) == 1
