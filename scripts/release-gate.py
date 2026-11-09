@@ -255,7 +255,9 @@ def native_user_id(name):
     return matches[0]
 
 
-USERS_INDEX = json.dumps({'$$indexCreated': {'fieldName': 'username', 'unique': True, 'sparse': False}}) + '\n'
+# Byte-identical to the 73-byte users.db found on an affected install.
+USERS_INDEX = json.dumps({'$$indexCreated': {'fieldName': 'username', 'unique': True, 'sparse': False}},
+                         separators=(',', ':')) + '\n'
 
 
 def prepare_database(volume, files):
@@ -514,11 +516,14 @@ try:
     status, state = auth_state(unfixed)
     assert state.get('initialUser') is True and not native_users(unfixed), 'Fixture did not reproduce the first-run page'
     command(['docker', 'stop', '--time', '45', unfixed])
-    # Flood adds its own index lines, so keep the file exactly as 0.16.25 left it.
+    # Flood rewrites users.db in its own format on start, so compare the backup
+    # with the file exactly as 0.16.25 left it.
     left_by_default = command(['docker', 'run', '--rm', '--network', 'none', '--label', 'appbox.release-gate=' + run_id,
                                '-v', userless_storage[1] + ':/data', '--entrypoint', 'cat', image,
                                '/data/db/users.db']).decode()
-    assert USERS_INDEX in left_by_default
+    left_records = [json.loads(line) for line in left_by_default.splitlines() if line.strip()]
+    assert any(record.get('$$indexCreated', {}).get('fieldName') == 'username' for record in left_records)
+    assert not any(record.get('username') for record in left_records)
     seeded = launch('userless-fixed', image, userless_storage)
     wait_ready(seeded, RTORRENT)
     status, state = auth_state(seeded)
@@ -544,8 +549,10 @@ try:
           'special-character login and password reset work', flush=True)
     deleted_storage = storage('deleted')
     prepare_database(deleted_storage[1], {'db/users.db': USERS_INDEX
-                                          + json.dumps({'username': 'olduser', 'password': 'x', '_id': 'a1b2c3d4e5f60718'}) + '\n'
-                                          + json.dumps({'$$deleted': True, '_id': 'a1b2c3d4e5f60718'}) + '\n'})
+                                          + json.dumps({'username': 'olduser', 'password': 'x', '_id': 'a1b2c3d4e5f60718'},
+                                                       separators=(',', ':')) + '\n'
+                                          + json.dumps({'$$deleted': True, '_id': 'a1b2c3d4e5f60718'},
+                                                       separators=(',', ':')) + '\n'})
     recreated = launch('deleted-users', image, deleted_storage)
     wait_ready(recreated, RTORRENT)
     native_user_id(recreated)
